@@ -15,12 +15,11 @@ from urllib.parse import quote
 from django.test import TestCase
 from django.test import TransactionTestCase
 from django.test.client import RequestFactory
-from packageurl import PackageURL
 from rest_framework import status
 from rest_framework.test import APIClient
 
-from vulnerabilities.api import MinimalPackageSerializer
 from vulnerabilities.api import PackageSerializer
+from vulnerabilities.api import VulnerabilityReferenceSerializer
 from vulnerabilities.models import Alias
 from vulnerabilities.models import ApiUser
 from vulnerabilities.models import Package
@@ -28,7 +27,9 @@ from vulnerabilities.models import PackageRelatedVulnerability
 from vulnerabilities.models import Vulnerability
 from vulnerabilities.models import VulnerabilityReference
 from vulnerabilities.models import VulnerabilityRelatedReference
+from vulnerabilities.models import VulnerabilitySeverity
 from vulnerabilities.models import Weakness
+from vulnerabilities.severity_systems import EPSS
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEST_DATA = os.path.join(BASE_DIR, "test_data")
@@ -161,13 +162,16 @@ class TestSerializers(TransactionTestCase):
             namespace="ubuntu",
             qualifiers={"distro": "jessie"},
         )
+        self.ref = VulnerabilityReference.objects.create(
+            reference_type="advisory", reference_id="CVE-xxx-xxx", url="https://example.com"
+        )
         self.user = ApiUser.objects.create_api_user(username="e@mail.com")
         self.auth = f"Token {self.user.auth_token.key}"
         self.client = APIClient(enforce_csrf_checks=True)
         self.client.credentials(HTTP_AUTHORIZATION=self.auth)
 
     def test_package_serializer(self):
-        pk = Package.objects.filter(name="mimetex")
+        pk = Package.objects.filter(name="mimetex").with_is_vulnerable()
         mock_request = RequestFactory().get("/api")
         response = PackageSerializer(pk, many=True, context={"request": mock_request}).data
         self.assertEqual(1, len(response))
@@ -180,6 +184,16 @@ class TestSerializers(TransactionTestCase):
 
         purls = {r["purl"] for r in response}
         self.assertIn("pkg:deb/ubuntu/mimetex@1.50-1.1?distro=jessie", purls)
+
+    def test_vulnerability_reference_serializer(self):
+        response = VulnerabilityReferenceSerializer(instance=self.ref).data
+        assert response == {
+            "reference_url": "https://example.com",
+            "reference_id": "CVE-xxx-xxx",
+            "reference_type": "advisory",
+            "scores": [],
+            "url": "https://example.com",
+        }
 
 
 class APITestCaseVulnerability(TransactionTestCase):
@@ -199,6 +213,23 @@ class APITestCaseVulnerability(TransactionTestCase):
             PackageRelatedVulnerability.objects.create(
                 package=pkg, vulnerability=self.vulnerability, fix=True
             )
+
+        self.reference1 = VulnerabilityReference.objects.create(
+            reference_id="",
+            url="https://.com",
+        )
+
+        VulnerabilitySeverity.objects.create(
+            reference=self.reference1,
+            scoring_system=EPSS.identifier,
+            scoring_elements=".0016",
+            value="0.526",
+        )
+
+        VulnerabilityRelatedReference.objects.create(
+            reference=self.reference1, vulnerability=self.vulnerability
+        )
+
         self.weaknesses = Weakness.objects.create(cwe_id=119)
         self.weaknesses.vulnerabilities.add(self.vulnerability)
         self.invalid_weaknesses = Weakness.objects.create(
@@ -223,6 +254,7 @@ class APITestCaseVulnerability(TransactionTestCase):
             "url": f"http://testserver/api/vulnerabilities/{self.vulnerability.id}",
             "vulnerability_id": self.vulnerability.vulnerability_id,
             "summary": "test",
+            "severity_range_score": None,
             "aliases": [],
             "resource_url": f"http://testserver/vulnerabilities/{self.vulnerability.vulnerability_id}",
             "fixed_packages": [
@@ -242,12 +274,26 @@ class APITestCaseVulnerability(TransactionTestCase):
                 },
             ],
             "affected_packages": [],
-            "references": [],
+            "references": [
+                {
+                    "reference_url": "https://.com",
+                    "reference_id": "",
+                    "reference_type": "",
+                    "scores": [
+                        {
+                            "value": "0.526",
+                            "scoring_system": "epss",
+                            "scoring_elements": ".0016",
+                        }
+                    ],
+                    "url": "https://.com",
+                }
+            ],
             "weaknesses": [
                 {
                     "cwe_id": 119,
                     "name": "Improper Restriction of Operations within the Bounds of a Memory Buffer",
-                    "description": "The software performs operations on a memory buffer, but it can read from or write to a memory location that is outside of the intended boundary of the buffer.",
+                    "description": "The product performs operations on a memory buffer, but it can read from or write to a memory location that is outside of the intended boundary of the buffer.",
                 },
             ],
         }
@@ -260,6 +306,7 @@ class APITestCaseVulnerability(TransactionTestCase):
             "url": f"http://testserver/api/vulnerabilities/{self.vulnerability.id}",
             "vulnerability_id": self.vulnerability.vulnerability_id,
             "summary": "test",
+            "severity_range_score": None,
             "aliases": [],
             "resource_url": f"http://testserver/vulnerabilities/{self.vulnerability.vulnerability_id}",
             "fixed_packages": [
@@ -272,15 +319,190 @@ class APITestCaseVulnerability(TransactionTestCase):
                 },
             ],
             "affected_packages": [],
-            "references": [],
+            "references": [
+                {
+                    "reference_url": "https://.com",
+                    "reference_id": "",
+                    "reference_type": "",
+                    "scores": [
+                        {
+                            "value": "0.526",
+                            "scoring_system": "epss",
+                            "scoring_elements": ".0016",
+                        }
+                    ],
+                    "url": "https://.com",
+                }
+            ],
             "weaknesses": [
                 {
                     "cwe_id": 119,
                     "name": "Improper Restriction of Operations within the Bounds of a Memory Buffer",
-                    "description": "The software performs operations on a memory buffer, but it can read from or write to a memory location that is outside of the intended boundary of the buffer.",
+                    "description": "The product performs operations on a memory buffer, but it can read from or write to a memory location that is outside of the intended boundary of the buffer.",
                 },
             ],
         }
+
+
+def set_as_affected_by(package, vulnerability):
+    """
+    Set the ``package`` Package as affected by the ``vulnerability`` Vulnerability.
+    """
+    _set_pkg_as(package, vulnerability, fixing=False)
+
+
+def set_as_fixing(package, vulnerability):
+    """
+    Set the ``package`` Package as fixing the ``vulnerability`` Vulnerability.
+    """
+    _set_pkg_as(package, vulnerability, fixing=True)
+
+
+def _set_pkg_as(package, vulnerability, fixing=False):
+    """
+    Set the ``package`` Package as affected or fixing the ``vulnerability`` Vulnerability.
+    """
+    PackageRelatedVulnerability.objects.create(
+        package=package,
+        vulnerability=vulnerability,
+        fix=fixing,
+    )
+
+
+def create_vuln(vcid, aliases=()):
+    """
+    Return a test Vulnerability using the ``vcid`` string as VCID, using optional aliases.
+    """
+    vuln = Vulnerability.objects.create(summary=f"This is {vcid}", vulnerability_id=vcid)
+    add_aliases(vuln, aliases)
+    return vuln
+
+
+def add_aliases(vuln, aliases):
+    """
+    Add aliases to ``vuln`` Vulnerability.
+    """
+    for alias in aliases:
+        Alias.objects.create(alias=alias, vulnerability=vuln)
+
+
+class APIPerformanceTest(TestCase):
+    def setUp(self):
+        self.user = ApiUser.objects.create_api_user(username="e@mail.com")
+        self.auth = f"Token {self.user.auth_token.key}"
+        self.csrf_client = APIClient(enforce_csrf_checks=True)
+        self.csrf_client.credentials(HTTP_AUTHORIZATION=self.auth)
+
+        # This setup creates the following data:
+        # vulnerabilities: vul1, vul2, vul3
+        # pkg:maven/com.fasterxml.jackson.core/jackson-databind
+        # with these versions:
+        # pkg_2_12_6:     @ 2.12.6       affected by        fixing vul3
+        # pkg_2_12_6_1:   @ 2.12.6.1     affected by vul2   fixing vul1
+        # pkg_2_13_1:     @ 2.13.1       affected by vul1   fixing vul3
+        # pkg_2_13_2:     @ 2.13.2       affected by vul2   fixing vul1
+        # pkg_2_14_0_rc1: @ 2.14.0-rc1   affected by        fixing
+
+        # searched-for pkg's vuln
+        self.vul1 = create_vuln("VCID-vul1-vul1-vul1", ["CVE-2020-36518", "GHSA-57j2-w4cx-62h2"])
+        self.vul2 = create_vuln("VCID-vul2-vul2-vul2")
+        # This is the vuln fixed by the searched-for pkg -- and by a lesser version (created below),
+        # which WILL be included in the API
+        self.vul3 = create_vuln("VCID-vul3-vul3-vul3", ["CVE-2021-46877", "GHSA-3x8x-79m2-3w2w"])
+
+        from_purl = Package.objects.from_purl
+        # lesser-version pkg that also fixes the vuln fixed by the searched-for pkg
+        self.pkg_2_12_6 = from_purl("pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.12.6")
+        # this is a lesser version omitted from the API that fixes searched-for pkg's vuln
+        self.pkg_2_12_6_1 = from_purl(
+            "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.12.6.1"
+        )
+        # searched-for pkg
+        self.pkg_2_13_1 = from_purl("pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.13.1")
+        # this is a greater version that fixes searched-for pkg's vuln
+        self.pkg_2_13_2 = from_purl("pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.13.2")
+        # This addresses both next and latest non-vulnerable pkg
+        self.pkg_2_14_0_rc1 = from_purl(
+            "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.14.0-rc1"
+        )
+
+        set_as_fixing(package=self.pkg_2_12_6, vulnerability=self.vul3)
+
+        set_as_affected_by(package=self.pkg_2_12_6_1, vulnerability=self.vul2)
+        set_as_fixing(package=self.pkg_2_12_6_1, vulnerability=self.vul1)
+
+        set_as_affected_by(package=self.pkg_2_13_1, vulnerability=self.vul1)
+        set_as_fixing(package=self.pkg_2_13_1, vulnerability=self.vul3)
+
+        set_as_affected_by(package=self.pkg_2_13_2, vulnerability=self.vul2)
+        set_as_fixing(package=self.pkg_2_13_2, vulnerability=self.vul1)
+
+    def test_api_packages_all_num_queries(self):
+        with self.assertNumQueries(4):
+            # There are 4 queries:
+            # 1. SAVEPOINT
+            # 2. Authenticating user
+            # 3. Get all vulnerable packages
+            # 4. RELEASE SAVEPOINT
+            response = self.csrf_client.get(f"/api/packages/all", format="json").data
+
+            assert len(response) == 3
+            assert list(response) == [
+                "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.12.6.1",
+                "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.13.1",
+                "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.13.2",
+            ]
+
+    def test_api_packages_single_num_queries(self):
+        with self.assertNumQueries(8):
+            self.csrf_client.get(f"/api/packages/{self.pkg_2_14_0_rc1.id}", format="json")
+
+    def test_api_packages_single_with_purl_in_query_num_queries(self):
+        with self.assertNumQueries(9):
+            self.csrf_client.get(f"/api/packages/?purl={self.pkg_2_14_0_rc1.purl}", format="json")
+
+    def test_api_packages_single_with_purl_no_version_in_query_num_queries(self):
+        with self.assertNumQueries(64):
+            self.csrf_client.get(
+                f"/api/packages/?purl=pkg:maven/com.fasterxml.jackson.core/jackson-databind",
+                format="json",
+            )
+
+    def test_api_packages_bulk_search(self):
+        with self.assertNumQueries(45):
+            packages = [self.pkg_2_12_6, self.pkg_2_12_6_1, self.pkg_2_13_1]
+            purls = [p.purl for p in packages]
+
+            data = {"purls": purls, "purl_only": False, "plain_purl": True}
+
+            resp = self.csrf_client.post(
+                f"/api/packages/bulk_search",
+                data=json.dumps(data),
+                content_type="application/json",
+            ).json()
+
+    def test_api_packages_with_lookup(self):
+        with self.assertNumQueries(14):
+            data = {"purl": self.pkg_2_12_6.purl}
+
+            resp = self.csrf_client.post(
+                f"/api/packages/lookup",
+                data=json.dumps(data),
+                content_type="application/json",
+            ).json()
+
+    def test_api_packages_bulk_lookup(self):
+        with self.assertNumQueries(45):
+            packages = [self.pkg_2_12_6, self.pkg_2_12_6_1, self.pkg_2_13_1]
+            purls = [p.purl for p in packages]
+
+            data = {"purls": purls}
+
+            resp = self.csrf_client.post(
+                f"/api/packages/bulk_lookup",
+                data=json.dumps(data),
+                content_type="application/json",
+            ).json()
 
 
 class APITestCasePackage(TestCase):
@@ -290,155 +512,55 @@ class APITestCasePackage(TestCase):
         self.csrf_client = APIClient(enforce_csrf_checks=True)
         self.csrf_client.credentials(HTTP_AUTHORIZATION=self.auth)
 
-        # searched-for pkg
-        self.package_maven_jackson_databind_2_13_1 = Package.objects.create(
-            type="maven",
-            namespace="com.fasterxml.jackson.core",
-            name="jackson-databind",
-            version="2.13.1",
-            qualifiers={},
-            subpath="",
-        )
+        # This setup creates the following data:
+        # vulnerabilities: vul1, vul2, vul3
+        # pkg:maven/com.fasterxml.jackson.core/jackson-databind
+        # with these versions:
+        # pkg_2_12_6:     @ 2.12.6       affected by        fixing vul3
+        # pkg_2_12_6_1:   @ 2.12.6.1     affected by vul2   fixing vul1
+        # pkg_2_13_1:     @ 2.13.1       affected by vul1   fixing vul3
+        # pkg_2_13_2:     @ 2.13.2       affected by vul2   fixing vul1
+        # pkg_2_14_0_rc1: @ 2.14.0-rc1   affected by        fixing
 
         # searched-for pkg's vuln
-        self.vuln_VCID_2nyb_8rwu_aaag = Vulnerability.objects.create(
-            summary="This is VCID-2nyb-8rwu-aaag",
-            vulnerability_id="VCID-2nyb-8rwu-aaag",
-        )
+        self.vul1 = create_vuln("VCID-vul1-vul1-vul1", ["CVE-2020-36518", "GHSA-57j2-w4cx-62h2"])
+        self.vul2 = create_vuln("VCID-vul2-vul2-vul2")
+        # This is the vuln fixed by the searched-for pkg -- and by a lesser version (created below),
+        # which WILL be included in the API
+        self.vul3 = create_vuln("VCID-vul3-vul3-vul3", ["CVE-2021-46877", "GHSA-3x8x-79m2-3w2w"])
 
-        # pkg-vuln affect relationship
-        PackageRelatedVulnerability.objects.create(
-            package=self.package_maven_jackson_databind_2_13_1,
-            vulnerability=self.vuln_VCID_2nyb_8rwu_aaag,
-            fix=False,
-        )
-
-        # vuln aliases
-        Alias.objects.create(alias="CVE-2020-36518", vulnerability=self.vuln_VCID_2nyb_8rwu_aaag)
-        Alias.objects.create(
-            alias="GHSA-57j2-w4cx-62h2", vulnerability=self.vuln_VCID_2nyb_8rwu_aaag
-        )
-
-        # pkg (1 of 2 -- this is a lesser version and will be omitted from the API) that fixes searched-for pkg's vuln
-        self.package_maven_jackson_databind_2_12_6_1 = Package.objects.create(
-            type="maven",
-            namespace="com.fasterxml.jackson.core",
-            name="jackson-databind",
-            version="2.12.6.1",
-            qualifiers={},
-            subpath="",
-        )
-
-        # pkg-vuln fix relationship
-        PackageRelatedVulnerability.objects.create(
-            package=self.package_maven_jackson_databind_2_12_6_1,
-            vulnerability=self.vuln_VCID_2nyb_8rwu_aaag,
-            fix=True,
-        )
-
-        # fixed by pkg own vuln
-        self.vuln_VCID_gqhw_ngh8_aaap = Vulnerability.objects.create(
-            summary="This is VCID-gqhw-ngh8-aaap",
-            vulnerability_id="VCID-gqhw-ngh8-aaap",
-        )
-
-        # pkg-vuln affect relationship
-        PackageRelatedVulnerability.objects.create(
-            package=self.package_maven_jackson_databind_2_12_6_1,
-            vulnerability=self.vuln_VCID_gqhw_ngh8_aaap,
-            fix=False,
-        )
-
-        # pkg (2 of 2 -- this is a greater version) that fixes searched-for pkg's vuln
-        self.package_maven_jackson_databind_2_13_2 = Package.objects.create(
-            type="maven",
-            namespace="com.fasterxml.jackson.core",
-            name="jackson-databind",
-            version="2.13.2",
-            qualifiers={},
-            subpath="",
-        )
-
-        # pkg-vuln fix relationship
-        PackageRelatedVulnerability.objects.create(
-            package=self.package_maven_jackson_databind_2_13_2,
-            vulnerability=self.vuln_VCID_2nyb_8rwu_aaag,
-            fix=True,
-        )
-
-        # pkg-vuln affect relationship
-        PackageRelatedVulnerability.objects.create(
-            package=self.package_maven_jackson_databind_2_13_2,
-            vulnerability=self.vuln_VCID_gqhw_ngh8_aaap,
-            fix=False,
-        )
-
-        # This is the vuln fixed by the searched-for pkg -- and by a lesser version (created below), which WILL be included in the API
-        self.vuln_VCID_ftmk_wbwx_aaar = Vulnerability.objects.create(
-            summary="This is VCID-ftmk-wbwx-aaar",
-            vulnerability_id="VCID-ftmk-wbwx-aaar",
-        )
-
-        # searched-for pkg-vuln fix relationship
-        PackageRelatedVulnerability.objects.create(
-            package=self.package_maven_jackson_databind_2_13_1,
-            vulnerability=self.vuln_VCID_ftmk_wbwx_aaar,
-            fix=True,
-        )
-
+        from_purl = Package.objects.from_purl
         # lesser-version pkg that also fixes the vuln fixed by the searched-for pkg
-        self.package_maven_jackson_databind_2_12_6 = Package.objects.create(
-            type="maven",
-            namespace="com.fasterxml.jackson.core",
-            name="jackson-databind",
-            version="2.12.6",
-            qualifiers={},
-            subpath="",
+        self.pkg_2_12_6 = from_purl("pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.12.6")
+        # this is a lesser version omitted from the API that fixes searched-for pkg's vuln
+        self.pkg_2_12_6_1 = from_purl(
+            "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.12.6.1"
         )
-
-        # lesser-version pkg-vuln fix relationship
-        PackageRelatedVulnerability.objects.create(
-            package=self.package_maven_jackson_databind_2_12_6,
-            vulnerability=self.vuln_VCID_ftmk_wbwx_aaar,
-            fix=True,
-        )
-
-        # aliases for vuln fixed by searched-for pkg
-        Alias.objects.create(alias="CVE-2021-46877", vulnerability=self.vuln_VCID_ftmk_wbwx_aaar)
-        Alias.objects.create(
-            alias="GHSA-3x8x-79m2-3w2w", vulnerability=self.vuln_VCID_ftmk_wbwx_aaar
-        )
-
+        # searched-for pkg
+        self.pkg_2_13_1 = from_purl("pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.13.1")
+        # this is a greater version that fixes searched-for pkg's vuln
+        self.pkg_2_13_2 = from_purl("pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.13.2")
         # This addresses both next and latest non-vulnerable pkg
-        self.package_maven_jackson_databind_2_14_0_rc1 = Package.objects.create(
-            type="maven",
-            namespace="com.fasterxml.jackson.core",
-            name="jackson-databind",
-            version="2.14.0-rc1",
-            qualifiers={},
-            subpath="",
+        self.pkg_2_14_0_rc1 = from_purl(
+            "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.14.0-rc1"
         )
 
-    def test_api_with_package_with_no_vulnerabilities(self):
-        affected_vulnerabilities = []
-        vuln = {
-            "foo": "bar",
-        }
+        set_as_fixing(package=self.pkg_2_12_6, vulnerability=self.vul3)
 
-        package_with_no_vulnerabilities = MinimalPackageSerializer.get_vulnerability(
-            self,
-            vuln,
-        )
+        set_as_affected_by(package=self.pkg_2_12_6_1, vulnerability=self.vul2)
+        set_as_fixing(package=self.pkg_2_12_6_1, vulnerability=self.vul1)
 
-        assert package_with_no_vulnerabilities is None
+        set_as_affected_by(package=self.pkg_2_13_1, vulnerability=self.vul1)
+        set_as_fixing(package=self.pkg_2_13_1, vulnerability=self.vul3)
+
+        set_as_affected_by(package=self.pkg_2_13_2, vulnerability=self.vul2)
+        set_as_fixing(package=self.pkg_2_13_2, vulnerability=self.vul1)
 
     def test_api_with_lesser_and_greater_fixed_by_packages(self):
-        response = self.csrf_client.get(
-            f"/api/packages/{self.package_maven_jackson_databind_2_13_1.id}", format="json"
-        ).data
+        response = self.csrf_client.get(f"/api/packages/{self.pkg_2_13_1.id}", format="json").data
 
         expected_response = {
-            "url": f"http://testserver/api/packages/{self.package_maven_jackson_databind_2_13_1.id}",
+            "url": f"http://testserver/api/packages/{self.pkg_2_13_1.id}",
             "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.13.1",
             "type": "maven",
             "namespace": "com.fasterxml.jackson.core",
@@ -446,6 +568,7 @@ class APITestCasePackage(TestCase):
             "version": "2.13.1",
             "qualifiers": {},
             "subpath": "",
+            "is_vulnerable": True,
             "next_non_vulnerable_version": "2.14.0-rc1",
             "latest_non_vulnerable_version": "2.14.0-rc1",
             "affected_by_vulnerabilities": [
@@ -453,10 +576,10 @@ class APITestCasePackage(TestCase):
                     [
                         (
                             "url",
-                            f"http://testserver/api/vulnerabilities/{self.vuln_VCID_2nyb_8rwu_aaag.id}",
+                            f"http://testserver/api/vulnerabilities/{self.vul1.id}",
                         ),
-                        ("vulnerability_id", "VCID-2nyb-8rwu-aaag"),
-                        ("summary", "This is VCID-2nyb-8rwu-aaag"),
+                        ("vulnerability_id", "VCID-vul1-vul1-vul1"),
+                        ("summary", "This is VCID-vul1-vul1-vul1"),
                         ("references", []),
                         (
                             "fixed_packages",
@@ -465,7 +588,7 @@ class APITestCasePackage(TestCase):
                                     [
                                         (
                                             "url",
-                                            f"http://testserver/api/packages/{self.package_maven_jackson_databind_2_13_2.id}",
+                                            f"http://testserver/api/packages/{self.pkg_2_13_2.id}",
                                         ),
                                         (
                                             "purl",
@@ -474,7 +597,7 @@ class APITestCasePackage(TestCase):
                                         ("is_vulnerable", True),
                                         (
                                             "affected_by_vulnerabilities",
-                                            [{"vulnerability": "VCID-gqhw-ngh8-aaap"}],
+                                            [{"vulnerability": "VCID-vul2-vul2-vul2"}],
                                         ),
                                         (
                                             "resource_url",
@@ -485,7 +608,7 @@ class APITestCasePackage(TestCase):
                             ],
                         ),
                         ("aliases", ["CVE-2020-36518", "GHSA-57j2-w4cx-62h2"]),
-                        ("resource_url", "http://testserver/vulnerabilities/VCID-2nyb-8rwu-aaag"),
+                        ("resource_url", "http://testserver/vulnerabilities/VCID-vul1-vul1-vul1"),
                     ]
                 )
             ],
@@ -494,10 +617,10 @@ class APITestCasePackage(TestCase):
                     [
                         (
                             "url",
-                            f"http://testserver/api/vulnerabilities/{self.vuln_VCID_ftmk_wbwx_aaar.id}",
+                            f"http://testserver/api/vulnerabilities/{self.vul3.id}",
                         ),
-                        ("vulnerability_id", "VCID-ftmk-wbwx-aaar"),
-                        ("summary", "This is VCID-ftmk-wbwx-aaar"),
+                        ("vulnerability_id", "VCID-vul3-vul3-vul3"),
+                        ("summary", "This is VCID-vul3-vul3-vul3"),
                         ("references", []),
                         (
                             "fixed_packages",
@@ -506,7 +629,7 @@ class APITestCasePackage(TestCase):
                                     [
                                         (
                                             "url",
-                                            f"http://testserver/api/packages/{self.package_maven_jackson_databind_2_12_6.id}",
+                                            f"http://testserver/api/packages/{self.pkg_2_12_6.id}",
                                         ),
                                         (
                                             "purl",
@@ -524,7 +647,7 @@ class APITestCasePackage(TestCase):
                                     [
                                         (
                                             "url",
-                                            f"http://testserver/api/packages/{self.package_maven_jackson_databind_2_13_1.id}",
+                                            f"http://testserver/api/packages/{self.pkg_2_13_1.id}",
                                         ),
                                         (
                                             "purl",
@@ -533,7 +656,7 @@ class APITestCasePackage(TestCase):
                                         ("is_vulnerable", True),
                                         (
                                             "affected_by_vulnerabilities",
-                                            [{"vulnerability": "VCID-2nyb-8rwu-aaag"}],
+                                            [{"vulnerability": "VCID-vul1-vul1-vul1"}],
                                         ),
                                         (
                                             "resource_url",
@@ -544,17 +667,19 @@ class APITestCasePackage(TestCase):
                             ],
                         ),
                         ("aliases", ["CVE-2021-46877", "GHSA-3x8x-79m2-3w2w"]),
-                        ("resource_url", "http://testserver/vulnerabilities/VCID-ftmk-wbwx-aaar"),
+                        ("resource_url", "http://testserver/vulnerabilities/VCID-vul3-vul3-vul3"),
                     ]
                 )
             ],
             "resource_url": "http://testserver/packages/pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.13.1",
         }
 
-        assert response == expected_response
+        assert json.dumps(response, indent=2) == json.dumps(expected_response, indent=2)
 
-    def test_is_vulnerable_attribute(self):
-        self.assertTrue(self.package_maven_jackson_databind_2_13_1.is_vulnerable)
+    def test_is_vulnerable_attribute_only_exists_on_queryset(self):
+        assert not hasattr(self.pkg_2_13_1, "is_vulnerable")
+        pkgs = Package.objects.filter(pk=self.pkg_2_13_1.pk).with_is_vulnerable()
+        assert all(hasattr(p, "is_vulnerable") for p in pkgs)
 
     def test_api_status(self):
         response = self.csrf_client.get("/api/packages/", format="json")
@@ -584,7 +709,7 @@ class APITestCasePackage(TestCase):
             response = self.csrf_client.get(f"/api/packages/all", format="json").data
 
             assert len(response) == 3
-            assert response == [
+            assert list(response) == [
                 "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.12.6.1",
                 "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.13.1",
                 "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.13.2",
@@ -652,7 +777,7 @@ class BulkSearchAPIPackage(TestCase):
         self.auth = f"Token {self.user.auth_token.key}"
         self.csrf_client = APIClient(enforce_csrf_checks=True)
         self.csrf_client.credentials(HTTP_AUTHORIZATION=self.auth)
-        packages = [
+        packages = self.packages = [
             "pkg:nginx/nginx@0.6.18",
             "pkg:nginx/nginx@1.20.0",
             "pkg:nginx/nginx@1.21.0",
@@ -667,24 +792,18 @@ class BulkSearchAPIPackage(TestCase):
             "pkg:nginx/nginx@1.0.7",
             "pkg:nginx/nginx@1.0.15",
         ]
-        self.packages = packages
-        for package in packages:
-            purl = PackageURL.from_string(package)
-            attrs = {k: v for k, v in purl.to_dict().items() if v}
-            Package.objects.create(**attrs)
+        self.pkgs = [Package.objects.from_purl(p) for p in packages]
 
         vulnerable_packages = [
             "pkg:nginx/nginx@1.0.15?foo=bar",
             "pkg:nginx/nginx@1.0.15?foo=baz",
         ]
 
-        vuln = Vulnerability.objects.create(summary="test")
+        vulnerability = Vulnerability.objects.create(summary="test")
 
-        for package in vulnerable_packages:
-            purl = PackageURL.from_string(package)
-            attrs = {k: v for k, v in purl.to_dict().items() if v}
-            pkg = Package.objects.create(**attrs)
-            PackageRelatedVulnerability.objects.create(package=pkg, vulnerability=vuln)
+        for purl in vulnerable_packages:
+            package = Package.objects.from_purl(purl)
+            set_as_affected_by(package, vulnerability)
 
     def test_bulk_api_response(self):
         request_body = {

@@ -10,8 +10,11 @@
 import hashlib
 import json
 import logging
+import typing
 from contextlib import suppress
-from typing import Any
+from functools import cached_property
+from typing import Optional
+from typing import Union
 
 from cwe2.database import Database
 from django.contrib.auth import get_user_model
@@ -24,22 +27,23 @@ from django.core.validators import MinValueValidator
 from django.db import models
 from django.db import transaction
 from django.db.models import Count
+from django.db.models import Exists
+from django.db.models import OuterRef
 from django.db.models import Prefetch
 from django.db.models import Q
 from django.db.models.functions import Length
 from django.db.models.functions import Trim
 from django.urls import reverse
 from django.utils import timezone
-from django.utils.translation import gettext_lazy as _
 from packageurl import PackageURL
 from packageurl.contrib.django.models import PackageURLMixin
 from packageurl.contrib.django.models import PackageURLQuerySet
 from rest_framework.authtoken.models import Token
-from univers import versions
 from univers.version_range import RANGE_CLASS_BY_SCHEMES
 from univers.version_range import AlpineLinuxVersionRange
 from univers.versions import Version
 
+from aboutcode import hashid
 from vulnerabilities import utils
 from vulnerabilities.severity_systems import SCORING_SYSTEMS
 from vulnerabilities.utils import normalize_purl
@@ -50,6 +54,9 @@ logger = logging.getLogger(__name__)
 
 models.CharField.register_lookup(Length)
 models.CharField.register_lookup(Trim)
+
+# patch univers for missing entry
+RANGE_CLASS_BY_SCHEMES["alpine"] = AlpineLinuxVersionRange
 
 
 class BaseQuerySet(models.QuerySet):
@@ -71,8 +78,8 @@ class BaseQuerySet(models.QuerySet):
         paginator = Paginator(self, per_page=per_page)
         for page_number in paginator.page_range:
             page = paginator.page(page_number)
-            for object in page.object_list:
-                yield object
+            for obj in page.object_list:
+                yield obj
 
 
 class VulnerabilityQuerySet(BaseQuerySet):
@@ -272,9 +279,9 @@ class Vulnerability(models.Model):
         """
         Return this Package details URL.
         """
-        from rest_framework.reverse import reverse
+        from rest_framework.reverse import reverse as reved
 
-        return reverse(
+        return reved(
             "vulnerability_details",
             kwargs={"vulnerability_id": self.vulnerability_id},
             request=request,
@@ -319,6 +326,10 @@ class Weakness(models.Model):
     cwe_id = models.IntegerField(help_text="CWE id")
     vulnerabilities = models.ManyToManyField(Vulnerability, related_name="weaknesses")
     db = Database()
+
+    @property
+    def cwe(self):
+        return f"CWE-{self.cwe_id}"
 
     @property
     def weakness(self):
@@ -370,6 +381,22 @@ class VulnerabilityReference(models.Model):
         unique=True,
     )
 
+    ADVISORY = "advisory"
+    EXPLOIT = "exploit"
+    MAILING_LIST = "mailing_list"
+    BUG = "bug"
+    OTHER = "other"
+
+    REFERENCE_TYPES = [
+        (ADVISORY, "Advisory"),
+        (EXPLOIT, "Exploit"),
+        (MAILING_LIST, "Mailing List"),
+        (BUG, "Bug"),
+        (OTHER, "Other"),
+    ]
+
+    reference_type = models.CharField(max_length=20, choices=REFERENCE_TYPES, blank=True)
+
     reference_id = models.CharField(
         max_length=200,
         help_text="An optional reference ID, such as DSA-4465-1 when available",
@@ -379,7 +406,7 @@ class VulnerabilityReference(models.Model):
     objects = VulnerabilityReferenceQuerySet.as_manager()
 
     class Meta:
-        ordering = ["reference_id", "url"]
+        ordering = ["reference_id", "url", "reference_type"]
 
     def __str__(self):
         reference_id = f" {self.reference_id}" if self.reference_id else ""
@@ -432,17 +459,19 @@ class PackageQuerySet(BaseQuerySet, PackageURLQuerySet):
 
         return Package.objects.filter(**filter_dict).distinct()
 
-    def get_or_create_from_purl(self, purl: PackageURL):
+    def get_or_create_from_purl(self, purl: Union[PackageURL, str]):
         """
-        Return an existing or new Package (created if neeed) given a
-        ``purl`` PackageURL.
+        Return a new or existing Package given a ``purl`` PackageURL object or PURL string.
         """
-        if isinstance(purl, str):
-            purl = PackageURL.from_string(purl)
-
         package, is_created = Package.objects.get_or_create(**purl_to_dict(purl=purl))
 
         return package, is_created
+
+    def from_purl(self, purl: Union[PackageURL, str]):
+        """
+        Return a new Package given a ``purl`` PackageURL object or PURL string.
+        """
+        return Package.objects.create(**purl_to_dict(purl=purl))
 
     def affected(self):
         """
@@ -505,7 +534,13 @@ class PackageQuerySet(BaseQuerySet, PackageURLQuerySet):
         """
         Return a queryset matching the ``purl`` Package URL.
         """
-        return self.filter(**purl_to_dict(purl))
+        return self.filter(package_url=purl)
+
+    def for_purls(self, purls=()):
+        """
+        Return a queryset of Packages matching a list of PURLs.
+        """
+        return self.filter(package_url__in=purls).distinct()
 
     def with_cpes(self):
         """
@@ -515,24 +550,46 @@ class PackageQuerySet(BaseQuerySet, PackageURLQuerySet):
 
     def for_cpe(self, cpe):
         """
-        Return a queryset of Vulnerability that have the ``cpe`` as an NVD CPE reference.
+        Return a queryset of Packages that have the ``cpe`` as an NVD CPE reference.
         """
         return self.filter(vulnerabilities__vulnerabilityreference__reference_id__exact=cpe)
 
     def with_cves(self):
         """
-        Return a queryset of Vulnerability that have one or more NVD CVE aliases.
+        Return a queryset of Packages that have one or more NVD CVE aliases.
         """
         return self.filter(vulnerabilities__aliases__alias__startswith="CVE")
 
     def for_cve(self, cve):
         """
-        Return a queryset of Vulnerability that have the the NVD CVE ``cve`` as an alias.
+        Return a queryset of Packages that have the NVD CVE ``cve`` as a vulnerability alias.
         """
-        return self.filter(vulnerabilities__vulnerabilityreference__reference_id__exact=cve)
+        return self.filter(vulnerabilities__aliases__alias=cve)
 
-    def for_purls(self, purls=[]):
-        return Package.objects.filter(package_url__in=purls).distinct()
+    def with_is_vulnerable(self):
+        """
+        Annotate Package with ``with_is_vulnerable`` boolean attribute.
+        """
+        return self.annotate(
+            is_vulnerable=Exists(
+                PackageRelatedVulnerability.objects.filter(
+                    package=OuterRef("pk"),
+                    fix=False,
+                )
+            )
+        )
+
+    def only_vulnerable(self):
+        return self._vulnerable(True)
+
+    def only_non_vulnerable(self):
+        return self._vulnerable(False)
+
+    def _vulnerable(self, vulnerable=True):
+        """
+        Filter to select only vulnerable or non-vulnearble packages.
+        """
+        return self.with_is_vulnerable().filter(is_vulnerable=vulnerable)
 
 
 def get_purl_query_lookups(purl):
@@ -571,6 +628,11 @@ class Package(PackageURLMixin):
         null=False,
         help_text="The Package URL for this package without qualifiers and subpath.",
         db_index=True,
+    )
+
+    is_ghost = models.BooleanField(
+        default=False,
+        help_text="True if the package does not exist in the upstream package manager or its repository.",
     )
 
     objects = PackageQuerySet.as_manager()
@@ -640,13 +702,6 @@ class Package(PackageURLMixin):
         return Package.objects.fixing_packages(package=self).distinct()
 
     @property
-    def is_vulnerable(self) -> bool:
-        """
-        Returns True if this package is vulnerable to any vulnerability.
-        """
-        return self.affected_by.exists()
-
-    @property
     def history(self):
         return self.changelog.all()
 
@@ -666,27 +721,60 @@ class Package(PackageURLMixin):
 
     def sort_by_version(self, packages):
         """
-        Return a list of `packages` sorted by version.
+        Return a sequence of `packages` sorted by version.
         """
         if not packages:
             return []
+        return sorted(packages, key=lambda x: self.version_class(x.version))
 
-        return sorted(
-            packages,
-            key=lambda x: self.version_class(x.version),
-        )
-
-    @property
+    @cached_property
     def version_class(self):
-        RANGE_CLASS_BY_SCHEMES["alpine"] = AlpineLinuxVersionRange
         range_class = RANGE_CLASS_BY_SCHEMES.get(self.type)
-        if not range_class:
-            return Version
-        return range_class.version_class
+        return range_class.version_class if range_class else Version
 
-    @property
+    @cached_property
     def current_version(self):
         return self.version_class(self.version)
+
+    @property
+    def next_non_vulnerable_version(self):
+        """
+        Return the version string of the next non-vulnerable package version.
+        """
+        next_non_vulnerable, _ = self.get_non_vulnerable_versions()
+        return next_non_vulnerable.version if next_non_vulnerable else None
+
+    @property
+    def latest_non_vulnerable_version(self):
+        """
+        Return the version string of the latest non-vulnerable package version.
+        """
+        _, latest_non_vulnerable = self.get_non_vulnerable_versions()
+        return latest_non_vulnerable.version if latest_non_vulnerable else None
+
+    def get_non_vulnerable_versions(self):
+        """
+        Return a tuple of the next and latest non-vulnerable versions as Package instance.
+        Return a tuple of (None, None) if there is no non-vulnerable version.
+        """
+        non_vulnerable_versions = Package.objects.get_fixed_by_package_versions(
+            self, fix=False
+        ).only_non_vulnerable()
+        sorted_versions = self.sort_by_version(non_vulnerable_versions)
+
+        later_non_vulnerable_versions = [
+            non_vuln_ver
+            for non_vuln_ver in sorted_versions
+            if self.version_class(non_vuln_ver.version) > self.current_version
+        ]
+
+        if later_non_vulnerable_versions:
+            sorted_versions = self.sort_by_version(later_non_vulnerable_versions)
+            next_non_vulnerable = sorted_versions[0]
+            latest_non_vulnerable = sorted_versions[-1]
+            return next_non_vulnerable, latest_non_vulnerable
+
+        return None, None
 
     @property
     def fixed_package_details(self):
@@ -704,35 +792,6 @@ class Package(PackageURLMixin):
         package_details["vulnerabilities"] = self.get_affecting_vulnerabilities()
 
         return package_details
-
-    def get_non_vulnerable_versions(self):
-        """
-        Return a tuple of the next and latest non-vulnerable versions as PackageURLs.  Return a tuple of
-        (None, None) if there is no non-vulnerable version.
-        """
-        package_versions = Package.objects.get_fixed_by_package_versions(self, fix=False)
-
-        non_vulnerable_versions = []
-        for version in package_versions:
-            if not version.is_vulnerable:
-                non_vulnerable_versions.append(version)
-
-        later_non_vulnerable_versions = []
-        for non_vuln_ver in non_vulnerable_versions:
-            if self.version_class(non_vuln_ver.version) > self.current_version:
-                later_non_vulnerable_versions.append(non_vuln_ver)
-
-        if later_non_vulnerable_versions:
-            sorted_versions = self.sort_by_version(later_non_vulnerable_versions)
-            next_non_vulnerable_version = sorted_versions[0]
-            latest_non_vulnerable_version = sorted_versions[-1]
-
-            next_non_vulnerable = PackageURL.from_string(next_non_vulnerable_version.purl)
-            latest_non_vulnerable = PackageURL.from_string(latest_non_vulnerable_version.purl)
-
-            return next_non_vulnerable, latest_non_vulnerable
-
-        return None, None
 
     def get_affecting_vulnerabilities(self):
         """
@@ -795,16 +854,32 @@ class Package(PackageURLMixin):
     @property
     def fixing_vulnerabilities(self):
         """
-        Return a queryset of Vulnerabilities that are fixed by this `package`.
+        Return a queryset of Vulnerabilities that are fixed by this package.
         """
         return self.vulnerabilities.filter(packagerelatedvulnerability__fix=True)
 
     @property
-    def affecting_vulnerabilities(self):
+    def affected_by_vulnerabilities(self):
+        """
+        Return a queryset of Vulnerabilities that affect this package.
+        """
+        return self.vulnerabilities.filter(packagerelatedvulnerability__fix=False)
+
+    affecting_vulnerabilities = affected_by_vulnerabilities
+
+    @property
+    def affecting_vulns(self):
         """
         Return a queryset of Vulnerabilities that affect this `package`.
         """
-        return self.vulnerabilities.filter(packagerelatedvulnerability__fix=False)
+        fixed_by_packages = Package.objects.get_fixed_by_package_versions(self, fix=True)
+        return self.vulnerabilities.affecting_vulnerabilities().prefetch_related(
+            Prefetch(
+                "packages",
+                queryset=fixed_by_packages,
+                to_attr="fixed_packages",
+            )
+        )
 
 
 class PackageRelatedVulnerability(models.Model):
@@ -830,6 +905,7 @@ class PackageRelatedVulnerability(models.Model):
         "module name responsible for creating this relation. Eg:"
         "vulnerabilities.importers.nginx.NginxBasicImprover",
     )
+
     from vulnerabilities.improver import MAX_CONFIDENCE
 
     confidence = models.PositiveIntegerField(
@@ -931,6 +1007,10 @@ class VulnerabilitySeverity(models.Model):
         "For example a CVSS vector string as used to compute a CVSS score.",
     )
 
+    published_at = models.DateTimeField(
+        blank=True, null=True, help_text="UTC Date of publication of the vulnerability severity"
+    )
+
     class Meta:
         unique_together = ["reference", "scoring_system", "value"]
         ordering = ["reference", "scoring_system", "value"]
@@ -978,7 +1058,7 @@ class Alias(models.Model):
     def __str__(self):
         return self.alias
 
-    @property
+    @cached_property
     def url(self):
         """
         Create a URL for the alias.
@@ -1034,7 +1114,7 @@ class Advisory(models.Model):
         max_length=100,
         help_text="Fully qualified name of the importer prefixed with the"
         "module name importing the advisory. Eg:"
-        "vulnerabilities.importers.nginx.NginxImporter",
+        "vulnerabilities.pipeline.nginx_importer.NginxImporterPipeline",
     )
     url = models.URLField(
         blank=True,
@@ -1361,7 +1441,7 @@ class Kev(models.Model):
 
     known_ransomware_campaign_use = models.BooleanField(
         default=False,
-        help_text="""Known if this vulnerability is known to have been leveraged as part of a ransomware campaign; 
+        help_text="""Known if this vulnerability is known to have been leveraged as part of a ransomware campaign;
         or 'Unknown' if CISA lacks confirmation that the vulnerability has been utilized for ransomware.""",
     )
 
