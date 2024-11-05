@@ -3,7 +3,7 @@
 # VulnerableCode is a trademark of nexB Inc.
 # SPDX-License-Identifier: Apache-2.0
 # See http://www.apache.org/licenses/LICENSE-2.0 for the license text.
-# See https://github.com/nexB/vulnerablecode for support or download.
+# See https://github.com/aboutcode-org/vulnerablecode for support or download.
 # See https://aboutcode.org for more information about nexB OSS projects.
 #
 
@@ -303,6 +303,13 @@ def test_get_package_versions(mock_response):
 
     improver = GitHubBasicImprover()
     valid_versions = [
+        "1.0.1",
+        "1.0.2",
+        "1.0.3",
+        "1.0.4",
+        "1.1",
+        "1.1.1",
+        "1.1.2",
         "1.1.3",
         "1.1.4",
         "1.10",
@@ -317,7 +324,9 @@ def test_get_package_versions(mock_response):
         "1.10a1",
         "1.10b1",
         "1.10rc1",
+        "vulnerabilities",
     ]
+
     result = sorted(
         improver.get_package_versions(package_url=PackageURL(type="pypi", name="django"))
     )

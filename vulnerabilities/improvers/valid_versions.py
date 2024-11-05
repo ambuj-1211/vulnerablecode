@@ -3,7 +3,7 @@
 # VulnerableCode is a trademark of nexB Inc.
 # SPDX-License-Identifier: Apache-2.0
 # See http://www.apache.org/licenses/LICENSE-2.0 for the license text.
-# See https://github.com/nexB/vulnerablecode for support or download.
+# See https://github.com/aboutcode-org/vulnerablecode for support or download.
 # See https://aboutcode.org for more information about nexB OSS projects.
 #
 
@@ -433,6 +433,7 @@ class GitHubBasicImprover(ValidVersionImprover):
             "3.0.0b3-",
             "3.0b6dev-r41684",
             "-class.-jw.util.version.Version-",
+            "vulnerabilities",
         ]
     )
 

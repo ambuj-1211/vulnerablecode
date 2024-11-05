@@ -3,7 +3,7 @@
 # VulnerableCode is a trademark of nexB Inc.
 # SPDX-License-Identifier: Apache-2.0
 # See http://www.apache.org/licenses/LICENSE-2.0 for the license text.
-# See https://github.com/nexB/vulnerablecode for support or download.
+# See https://github.com/aboutcode-org/vulnerablecode for support or download.
 # See https://aboutcode.org for more information about nexB OSS projects.
 #
 
@@ -26,7 +26,7 @@ from rest_framework.serializers import ValidationError
 from rest_framework.throttling import AnonRateThrottle
 
 from vulnerabilities.api import BaseResourceSerializer
-from vulnerabilities.models import Kev
+from vulnerabilities.models import Exploit
 from vulnerabilities.models import Package
 from vulnerabilities.models import Vulnerability
 from vulnerabilities.models import VulnerabilityReference
@@ -105,8 +105,21 @@ class V2WeaknessFullSerializer(ModelSerializer):
 
 class V2ExploitSerializer(ModelSerializer):
     class Meta:
-        model = Kev
-        fields = ("description", "required_action", "date_added", "due_date", "resources_and_notes")
+        model = Exploit
+        fields = [
+            "date_added",
+            "description",
+            "required_action",
+            "due_date",
+            "notes",
+            "known_ransomware_campaign_use",
+            "source_date_published",
+            "exploit_type",
+            "platform",
+            "source_date_updated",
+            "data_source",
+            "source_url",
+        ]
 
 
 class V2VulnerabilitySerializer(ModelSerializer):
@@ -225,8 +238,6 @@ class V2PackageFilterSet(filters.FilterSet):
             "qualifiers",
             "subpath",
             "purl",
-            # this hurts
-            "packagerelatedvulnerability__fix",
         ]
 
     def filter_purl(self, queryset, name, value):
