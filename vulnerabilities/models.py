@@ -155,17 +155,6 @@ class VulnerabilityQuerySet(BaseQuerySet):
             patched_package_count=Count("fixed_by_packages", distinct=True),
         )
 
-    def without_cvssv3_severity(self):
-        """
-        Return a queryset of Vulnerabilities that have severity information
-        but lack CVSSv3 or CVSSv3.1 scores.
-        """
-        return (
-            self.annotate(severity_count=models.Count("references__vulnerabilityseverity"))
-            .filter(severity_count__gt=0)
-            .exclude(references__vulnerabilityseverity__scoring_system__in=["cvssv3", "cvssv3.1"])
-        )
-
 
 class VulnerabilitySeverity(models.Model):
     url = models.URLField(
@@ -1074,6 +1063,17 @@ class AliasQuerySet(BaseQuerySet):
         Return a queryset of Aliases that are for a CVE.
         """
         return self.filter(alias__startswith="CVE")
+
+    def without_cvssv3_severity(self):
+        """
+        Return a queryset of Vulnerabilities that have severity information
+        but lack CVSSv3 or CVSSv3.1 scores.
+        """
+        return (
+            self.filter(alias__startswith="CVE")
+            .exclude(vulnerability__severities__scoring_system__in=["cvssv3", "cvssv3.1"])
+            .distinct()
+        )
 
 
 class Alias(models.Model):
